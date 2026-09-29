@@ -1,5 +1,0 @@
-Metadata-Version: 2.4
-Name: qwen-sepsis-training
-Version: 0.1.0
-Summary: QLoRA do Qwen3 8B para experimento acadêmico de classificação horária de sepse
-Requires-Python: <3.14,>=3.12
