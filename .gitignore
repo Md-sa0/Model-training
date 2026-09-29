@@ -1,0 +1,12 @@
+.venv/
+__pycache__/
+.pytest_cache/
+*.pyc
+data/raw/
+data/processed/
+models/
+outputs/
+hf-cache/
+.env
+*.log
+

@@ -1,0 +1,14 @@
+{
+  "model_id": "Qwen/Qwen3-8B",
+  "max_length": 512,
+  "epochs": 1,
+  "learning_rate": 0.0002,
+  "batch_size": 1,
+  "gradient_accumulation_steps": 16,
+  "lora_r": 16,
+  "lora_alpha": 32,
+  "lora_dropout": 0.05,
+  "seed": 42,
+  "output_dir": "models/qwen3-8b-sepsis-lora"
+}
+
