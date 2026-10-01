@@ -78,6 +78,12 @@ python -m qwen_sepsis.train --model-path models/base/Qwen3-8B
 
 O adapter é salvo em `models/qwen3-8b-sepsis-lora/final_adapter`. Interromper e reiniciar o treinamento ainda não retoma checkpoints automaticamente.
 
+## Resultados do treinamento
+
+O treinamento completou 1 época com loss de `0.24124`, em `69,740.4645` segundos. A velocidade média foi de `0.475` amostras/s (`0.03` passos/s), com `3.2076e17` FLOPs totais. Os valores completos estão em [`reports/train_metrics.json`](reports/train_metrics.json).
+
+A avaliação final ainda está pendente; portanto, estes resultados não incluem métricas de validação ou teste.
+
 ## Avaliação
 
 ```powershell
