@@ -1,0 +1,9 @@
+{
+  "target_sensitivity": 0.95,
+  "high_risk_probability": 0.7,
+  "trend_delta": 0.02,
+  "seed": 42,
+  "ece_bins": 10,
+  "batch_size": 4,
+  "max_length": 512
+}

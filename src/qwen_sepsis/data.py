@@ -106,6 +106,50 @@ def write_jsonl(df: pd.DataFrame, path: Path) -> None:
             target.write(json.dumps({"prompt": format_prompt(row), "label": str(int(row.SepsisLabel))}, ensure_ascii=False) + "\n")
 
 
+def normalize_patient_id(value) -> str:
+    if pd.isna(value):
+        raise ValueError("Patient_ID ausente")
+    if isinstance(value, (int, np.integer)):
+        return str(int(value))
+    if isinstance(value, (float, np.floating)) and float(value).is_integer():
+        return str(int(value))
+    text = str(value).strip()
+    if text.endswith(".0") and text[:-2].isdigit():
+        return text[:-2]
+    return text
+
+
+def hour_value(value) -> int:
+    number = float(value)
+    if not np.isfinite(number) or abs(number - round(number)) > 1e-6:
+        raise ValueError(f"Hora não inteira: {value}")
+    return int(round(number))
+
+
+def _index_value(column: str, value):
+    if column == "Patient_ID":
+        return normalize_patient_id(value)
+    if column == "Hour":
+        return hour_value(value)
+    if column == "SepsisLabel" or column.endswith("_missing"):
+        return int(value)
+    if pd.isna(value):
+        return None
+    return float(value)
+
+
+def write_patient_index(df: pd.DataFrame, path: Path) -> None:
+    """Índice alinhado ao jsonl para avaliação por paciente. O arquivo de treino não muda."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    columns = ["Patient_ID", "Hour", "SepsisLabel", *FEATURES, *[f"{name}_missing" for name in DYNAMIC]]
+    with path.open("w", encoding="utf-8") as target:
+        for row_index, (_, row) in enumerate(df.iterrows()):
+            record = {"row_index": row_index}
+            for column in columns:
+                record[column] = _index_value(column, row[column])
+            target.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+
 def prepare_dataset(raw_path: Path, output_dir: Path, seed: int = 42, train_negative_ratio: int = 3,
                     max_train: int | None = 40000, max_eval: int | None = 20000) -> dict[str, object]:
     source = pd.read_csv(raw_path)
@@ -126,10 +170,52 @@ def prepare_dataset(raw_path: Path, output_dir: Path, seed: int = 42, train_nega
         part = work[work.split == split]
         part = _sample_rows(part, max_train if split == "train" else max_eval, seed, train_negative_ratio if split == "train" else None)
         write_jsonl(part, output_dir / f"{split}.jsonl")
+        write_patient_index(part, output_dir / f"{split}_patients.jsonl")
         counts[split] = {"rows": len(part), "positive": int(part.SepsisLabel.sum()), "prevalence": float(part.SepsisLabel.mean())}
     metadata = {"raw_rows": raw_rows, "valid_rows": len(source), "invalid_rows": invalid_rows, "patients": int(source.Patient_ID.nunique()), "splits": counts}
     output_dir.mkdir(parents=True, exist_ok=True)
     (output_dir / "metadata.json").write_text(json.dumps(metadata, indent=2, ensure_ascii=False), encoding="utf-8")
     medians.rename("train_median").to_csv(output_dir / "train_medians.csv")
     return metadata
+
+
+def dataset_version(data_dir: Path | None = None) -> dict[str, object]:
+    payload: dict[str, object] = {"revision": REVISION, "sha256": EXPECTED_SHA256, "source": DATA_URL}
+    if data_dir is not None:
+        meta_path = Path(data_dir) / "metadata.json"
+        if meta_path.exists():
+            payload["prepare_metadata"] = json.loads(meta_path.read_text(encoding="utf-8"))
+    return payload
+
+
+def load_prepared_split(data_dir: Path, split: str) -> pd.DataFrame:
+    path = Path(data_dir) / f"{split}.jsonl"
+    index_path = Path(data_dir) / f"{split}_patients.jsonl"
+    if not path.exists():
+        raise FileNotFoundError(f"Arquivo ausente: {path}")
+    if path.stat().st_size == 0:
+        raise ValueError(f"Split vazio: {path}")
+    if not index_path.exists():
+        raise FileNotFoundError(
+            f"Índice de pacientes ausente: {index_path}. "
+            "Execute python -m qwen_sepsis.prepare para gerá-lo. "
+            "Os arquivos de treino continuam com prompt e label."
+        )
+    frame = pd.read_json(path, lines=True)
+    index = pd.read_json(index_path, lines=True)
+    if "prompt" not in frame.columns or "label" not in frame.columns:
+        raise ValueError(f"O jsonl de {split} precisa manter as colunas prompt e label.")
+    if len(index) != len(frame):
+        raise ValueError(f"Índice desalinhado em {split}: {len(index)} linhas contra {len(frame)} prompts")
+    if "row_index" not in index.columns or not np.array_equal(index["row_index"].to_numpy(), np.arange(len(index))):
+        raise ValueError(f"row_index fora de ordem em {split}")
+    for column in index.columns:
+        frame[column] = index[column].to_numpy()
+    labels = frame["label"].astype(int).to_numpy()
+    sepsis = frame["SepsisLabel"].astype(int).to_numpy()
+    if not np.array_equal(labels, sepsis):
+        raise ValueError(f"SepsisLabel não coincide com label em {split}")
+    frame["Patient_ID"] = frame["Patient_ID"].map(normalize_patient_id)
+    frame["Hour"] = frame["Hour"].map(hour_value)
+    return frame
 
