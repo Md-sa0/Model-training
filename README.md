@@ -92,7 +92,27 @@ python -m qwen_sepsis.evaluate `
   --adapter models/qwen3-8b-sepsis-lora/final_adapter
 ```
 
-O limiar é escolhido pela maior F1 na validação e aplicado uma única vez ao teste. As métricas são salvas em `outputs/evaluation.json`.
+O limiar é escolhido pela maior F1 na validação e aplicado uma única vez ao teste. As métricas são salvas em `outputs/evaluation.json`. Esse comando continua sendo a avaliação horária.
+
+## Calibração e avaliação por paciente
+
+O protocolo abaixo não retreina o Qwen. Ele lê os logits dos tokens `0` e `1`, calibra na validação, escolhe um limiar de alta sensibilidade e só então avalia o teste por paciente.
+
+Se os dados foram preparados antes deste protocolo, gere o índice de pacientes. O jsonl de treino continua só com `prompt` e `label`:
+
+```powershell
+python -m qwen_sepsis.prepare
+```
+
+Depois:
+
+```powershell
+python scripts/run_calibration.py
+```
+
+A meta padrão é 95% de sensibilidade. Ela fica em `configs/calibration.json`. O teste não ajusta calibrador, limiar nem regra temporal. Os artefatos ficam em `artifacts/calibration` e `artifacts/evaluation`.
+
+O resultado é um sistema experimental de apoio à decisão para previsão precoce de risco de sepse. Não substitui o diagnóstico médico.
 
 ## Testes de software
 
@@ -108,7 +128,7 @@ Eles verificam divisão por paciente, ausência de informação futura, limite t
 
 - O rótulo do desafio começa antes do início definido e permanece positivo; a classificação de todas as horas não mede exclusivamente antecipação em seis horas.
 - O uso de um LLM para dados tabulares é experimental. O benchmark tabular do repositório `predicao-precoce-sepse` deve permanecer como comparação.
-- O treino balanceado altera a distribuição vista pelo modelo. A avaliação usa prevalência natural e exige calibração posterior.
+- O treino balanceado altera a distribuição vista pelo modelo. A avaliação horária usa prevalência natural. A calibração e o limiar de alta sensibilidade são definidos só na validação, em `scripts/run_calibration.py`.
 - A validação clínica exige outra instituição, revisão das unidades e análise por paciente, hospital e subgrupos.
 
 ## Referências

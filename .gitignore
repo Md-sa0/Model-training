@@ -7,6 +7,7 @@ data/raw/
 data/processed/
 models/
 outputs/
+artifacts/
 hf-cache/
 .env
 *.log
