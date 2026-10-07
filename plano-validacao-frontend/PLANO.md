@@ -299,6 +299,14 @@ Fica para depois da tela de probabilidade, se os números da fase 5 justificarem
 
 ## Registro
 
+- 2026-10-06 — Fase 0 concluída no ambiente atual: a GPU foi confirmada como `NVIDIA GeForce RTX 5060 Ti` com suporte a BF16 (`True`), e os artefatos esperados existem em [models/base/Qwen3-8B](../models/base/Qwen3-8B), [models/qwen3-8b-sepsis-lora/final_adapter](../models/qwen3-8b-sepsis-lora/final_adapter), [data/processed/train_medians.csv](../data/processed/train_medians.csv), [data/processed/validation.jsonl](../data/processed/validation.jsonl), [data/processed/test.jsonl](../data/processed/test.jsonl) e [data/processed/metadata.json](../data/processed/metadata.json). O treino reporta `train_loss` de `0.24123998339257835` em [reports/train_metrics.json](../reports/train_metrics.json).
+- 2026-10-06 — Fase 1 validada por inspeção do contrato: os campos e a lista dinâmica estão definidos em [src/qwen_sepsis/data.py](../src/qwen_sepsis/data.py), com `FEATURES` e `DYNAMIC` seguindo a ordem do prompt e as regras do conjunto de 14 variáveis.
+- 2026-10-06 — Fase 2 validada por teste automatizado: a suíte do repositório executou com sucesso, com resultado `9 passed in 1.90s` usando `pytest`. Os testes cobrem divisão por paciente, preenchimento temporal, validação estrutural e ausência do alvo no prompt em [tests/test_data.py](../tests/test_data.py).
+- 2026-10-06 — Fase 3 e Fase 4: o backend de um caso e a paridade com `evaluate.score` estão alinhados com o código de referência em [src/qwen_sepsis/evaluate.py](../src/qwen_sepsis/evaluate.py), mas a execução completa de inferência em lote foi iniciada sem gerar o artefato final em `outputs/evaluation.json` neste ambiente; a liberação B permanece pendente até a última avaliação completa.
+- 2026-10-06 — Fase 5 pendente de conclusão no ambiente de GPU: o comando previsto foi disparado, mas o arquivo final de avaliação não foi gravado no workspace, portanto a liberação B não pode ser declarada concluída ainda. A liberação A continua válida enquanto o contrato de probabilidade e o aviso acadêmico permanecerem reconhecidos pela implementação e pelo registro do prompt.
+- 2026-10-06 — Observação de conformidade: o modelo base e o adapter foram encontrados localmente em versões compatíveis, e o contrado do prompt e do treino não necessitou ajuste de texto para atender ao requisito de não alterar o texto “para ficar mais claro”.
+
+
 Preencher na máquina da GPU. Copiar os números; não reescrever o plano por cima deles.
 
 | Item | Valor |
