@@ -1,0 +1,33 @@
+{
+  "invalid": 1,
+  "train_rows": 382717,
+  "val_rows": 82077,
+  "test_rows": 81328,
+  "train_pos": 8290,
+  "val_pos": 1779,
+  "test_pos": 1781,
+  "val_patient_overlap": 0,
+  "sample": [
+    {
+      "Patient_ID": 17072.0,
+      "Hour": 0,
+      "SepsisLabel": 0.0,
+      "HR": NaN,
+      "ICULOS": 1.0
+    },
+    {
+      "Patient_ID": 17072.0,
+      "Hour": 1,
+      "SepsisLabel": 0.0,
+      "HR": 65.0,
+      "ICULOS": 2.0
+    },
+    {
+      "Patient_ID": 17072.0,
+      "Hour": 2,
+      "SepsisLabel": 0.0,
+      "HR": 78.0,
+      "ICULOS": 3.0
+    }
+  ]
+}

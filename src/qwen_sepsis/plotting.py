@@ -50,7 +50,8 @@ def save_calibration_curve(path: Path, metrics_by_method: dict) -> None:
     _save(fig, path)
 
 
-def save_threshold_curve(path: Path, table: pd.DataFrame, selected_threshold: float, target_sensitivity: float) -> None:
+def save_threshold_curve(path: Path, table: pd.DataFrame, selected_threshold: float, target_sensitivity: float,
+                         evaluation_unit: str = "observação horária") -> None:
     fig, axes = plt.subplots(1, 2, figsize=(11, 4.5))
     axes[0].plot(table["threshold"], table["sensitivity"], label="Sensibilidade")
     axes[0].plot(table["threshold"], table["specificity"], label="Especificidade")
@@ -67,7 +68,7 @@ def save_threshold_curve(path: Path, table: pd.DataFrame, selected_threshold: fl
     axes[1].plot(table["threshold"], table["FP"], label="Falsos positivos")
     axes[1].axvline(selected_threshold, color="black", linestyle="--", label="Limiar escolhido")
     axes[1].set_xlabel("Limiar")
-    axes[1].set_ylabel("Contagem horária na validação")
+    axes[1].set_ylabel(f"Contagem por {evaluation_unit} na validação")
     axes[1].grid(True, alpha=0.3)
     axes[1].legend(loc="best", fontsize=8)
     axes[1].set_title("Falsos negativos e falsos positivos")
@@ -76,7 +77,7 @@ def save_threshold_curve(path: Path, table: pd.DataFrame, selected_threshold: fl
     _save(fig, path)
 
 
-def save_confusion_matrix(path: Path, y_true, y_pred):
+def save_confusion_matrix(path: Path, y_true, y_pred, title: str = "Matriz de confusão por paciente no teste"):
     matrix = confusion_matrix(y_true, y_pred, labels=[0, 1])
     fig, ax = plt.subplots(figsize=(5.8, 4.8))
     image = ax.imshow(matrix, cmap="Blues")
@@ -84,7 +85,7 @@ def save_confusion_matrix(path: Path, y_true, y_pred):
     ax.set_yticks([0, 1], ["Negativo", "Positivo"])
     ax.set_xlabel("Previsto")
     ax.set_ylabel("Real")
-    ax.set_title("Matriz de confusão por paciente no teste")
+    ax.set_title(title)
     names = [["TN", "FP"], ["FN", "TP"]]
     peak = matrix.max() if matrix.size else 0
     for row in range(2):

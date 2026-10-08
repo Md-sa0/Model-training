@@ -4,7 +4,16 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from qwen_sepsis.data import FEATURES, format_prompt, patient_split, prepare_dataset, temporal_fill, validate
+from qwen_sepsis.data import (
+    FEATURES,
+    assert_disjoint_patient_ids,
+    format_prompt,
+    load_prepared_split,
+    patient_split,
+    prepare_dataset,
+    temporal_fill,
+    validate,
+)
 
 
 def sample(patients=40):
@@ -64,4 +73,16 @@ def test_prepare_writes_disjoint_datasets(tmp_path: Path):
     for split in ["train", "validation", "test"]:
         path = tmp_path / "processed" / f"{split}.jsonl"
         assert path.exists() and path.stat().st_size > 0
+    validation = load_prepared_split(tmp_path / "processed", "validation")
+    test = load_prepared_split(tmp_path / "processed", "test")
+    assert validation.groupby("Patient_ID").size().eq(3).all()
+    assert test.groupby("Patient_ID").size().eq(3).all()
+    assert validation.groupby("Patient_ID", sort=False)["Hour"].apply(lambda hours: hours.is_monotonic_increasing).all()
+    assert test.groupby("Patient_ID", sort=False)["Hour"].apply(lambda hours: hours.is_monotonic_increasing).all()
+    assert_disjoint_patient_ids(validation["Patient_ID"], test["Patient_ID"])
+
+
+def test_patient_overlap_fails_explicitly():
+    with pytest.raises(ValueError, match="aparece em validation e test"):
+        assert_disjoint_patient_ids(["p1", "p2"], ["p2", "p3"])
 

@@ -207,6 +207,7 @@ def format_threshold_message(target: float, achieved: float, threshold: float, t
             "Nenhum limiar atingiu a sensibilidade alvo. "
             "Foi selecionado o limiar com maior sensibilidade."
         )
+        lines.append("WARNING: Target sensitivity of 95% was not achieved.")
     return "\n".join(lines)
 
 
@@ -218,7 +219,7 @@ def select_threshold(y_true, probabilities, target_sensitivity: float = 0.95, sp
     if set(np.unique(actual)) != {0, 1}:
         raise ValueError("A validação precisa conter as duas classes para escolher o limiar.")
     if thresholds is None:
-        thresholds = np.round(np.arange(1, 100) / 100, 2)
+        thresholds = np.round(np.arange(0, 101) / 100, 2)
     rows = []
     for threshold in thresholds:
         metrics = binary_metrics(actual, scores >= float(threshold))
@@ -234,16 +235,22 @@ def select_threshold(y_true, probabilities, target_sensitivity: float = 0.95, sp
             "TP": metrics["TP"],
             "TN": metrics["TN"],
             "MCC": metrics["mcc"],
+            "false_positive_rate": 1.0 - metrics["specificity"],
+            "false_negative_rate": 1.0 - metrics["sensitivity"],
         })
     table = pd.DataFrame(rows)
     eligible = table[table["sensitivity"] >= target_sensitivity]
     target_met = not eligible.empty
     if target_met:
-        pool = eligible.sort_values(["specificity", "threshold"], ascending=[False, False], kind="mergesort")
+        pool = eligible.sort_values(
+            ["specificity", "MCC", "PPV", "FP", "threshold"],
+            ascending=[False, False, False, True, False],
+            kind="mergesort",
+        )
     else:
         pool = table.sort_values(
-            ["sensitivity", "specificity", "threshold"],
-            ascending=[False, False, False],
+            ["sensitivity", "specificity", "MCC", "PPV", "FP", "threshold"],
+            ascending=[False, False, False, False, True, False],
             kind="mergesort",
         )
     chosen = pool.iloc[0]

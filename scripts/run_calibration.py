@@ -9,6 +9,7 @@ import argparse
 import json
 import random
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -18,7 +19,7 @@ if str(ROOT / "src") not in sys.path:
 import numpy as np
 
 from qwen_sepsis import MODEL_ID
-from qwen_sepsis.data import dataset_version, load_prepared_split
+from qwen_sepsis.data import assert_disjoint_patient_ids, dataset_version, load_patient_ids, load_prepared_split
 from qwen_sepsis.explain import DISCLAIMER
 from qwen_sepsis.inference import load_sepsis_model, score_prompts
 from qwen_sepsis.pipeline import (
@@ -64,6 +65,45 @@ def model_context(base_model: str, adapter: Path, token_meta: dict, data_dir: Pa
     return context
 
 
+def print_split_summary(frame, split: str) -> None:
+    labels = frame["label"].astype(int)
+    patient_labels = frame.assign(__label=labels).groupby("Patient_ID", sort=False)["__label"].max()
+    print(
+        f"{split.upper()} DISTRIBUTION: samples={len(frame)}, positive={int(labels.sum())}, "
+        f"negative={int((labels == 0).sum())}, positive_rate={labels.mean():.6f}, "
+        f"negative_rate={(labels == 0).mean():.6f}, patients={len(patient_labels)}, "
+        f"positive_patients={int(patient_labels.sum())}, negative_patients={int((patient_labels == 0).sum())}, "
+        f"patient_positive_rate={patient_labels.mean():.6f}",
+        flush=True,
+    )
+
+
+def print_smoke_rows(frame, records, calibrator=None, threshold: float | None = None) -> None:
+    import torch
+
+    if len(frame) != len(records):
+        raise RuntimeError("Smoke test: desalinhamento entre prompt, índice e logits")
+    for (_, row), record in zip(frame.iterrows(), records, strict=True):
+        probability = float(record["raw_probability"])
+        expected = float(torch.softmax(
+            torch.tensor([record["logit_0"], record["logit_1"]], dtype=torch.float64), dim=0,
+        )[1])
+        if not np.isclose(probability, expected, rtol=0.0, atol=1e-12):
+            raise RuntimeError("Smoke test: raw_probability diverge do softmax dos logits 0/1")
+        calibrated = float(calibrator.predict([probability])[0]) if calibrator is not None else None
+        prediction = int(calibrated >= threshold) if calibrated is not None and threshold is not None else None
+        print(
+            "SMOKE "
+            f"Patient_ID={row['Patient_ID']} Hour={int(row['Hour'])} label={int(row['label'])} "
+            f"logit_0={record['logit_0']:.6f} logit_1={record['logit_1']:.6f} "
+            f"raw_probability={probability:.8f} "
+            f"calibrated_probability={calibrated if calibrated is not None else 'pending'} "
+            f"threshold={threshold if threshold is not None else 'pending'} "
+            f"prediction={prediction if prediction is not None else 'pending'}",
+            flush=True,
+        )
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="Calibra o Qwen3-8B já treinado, escolhe o limiar na validação e avalia o teste por paciente.",
@@ -77,6 +117,7 @@ def main() -> None:
     parser.add_argument("--high-risk-probability", type=float, default=None)
     parser.add_argument("--batch-size", type=int, default=None)
     parser.add_argument("--seed", type=int, default=None)
+    parser.add_argument("--smoke-only", action="store_true", help="Pontua 10 pacientes e encerra antes da calibração completa.")
     args = parser.parse_args()
 
     runtime = load_runtime_config(args.config)
@@ -100,6 +141,13 @@ def main() -> None:
             + ", ".join(str(path) for path in missing)
         )
     validation = load_prepared_split(args.data_dir, "validation")
+    validation_ids = set(validation["Patient_ID"])
+    test_ids = load_patient_ids(args.data_dir, "test")
+    assert_disjoint_patient_ids(validation_ids, test_ids)
+    if not validation.groupby("Patient_ID", sort=False)["Hour"].apply(lambda hours: hours.is_monotonic_increasing).all():
+        raise ValueError("Hour fora de ordem crescente dentro de validation")
+    print(f"Patient leakage: PASS ({len(validation_ids & test_ids)} IDs compartilhados).", flush=True)
+    print_split_summary(validation, "validation")
 
     local_base = ROOT / "models" / "base" / "Qwen3-8B"
     base_model = args.base_model or (str(local_base) if local_base.exists() else MODEL_ID)
@@ -115,14 +163,52 @@ def main() -> None:
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
 
-    print("Extraindo logits de 0 e 1 na validação.", flush=True)
+    patient_labels = validation.groupby("Patient_ID", sort=True)["SepsisLabel"].max()
+    positive_ids = patient_labels[patient_labels == 1].index.tolist()
+    negative_ids = patient_labels[patient_labels == 0].index.tolist()
+    random.Random(seed).shuffle(positive_ids)
+    random.Random(seed + 1).shuffle(negative_ids)
+    smoke_ids = positive_ids[:5] + negative_ids[:5]
+    if len(smoke_ids) < 10:
+        remaining = [patient_id for patient_id in patient_labels.index if patient_id not in set(smoke_ids)]
+        smoke_ids.extend(remaining[:10 - len(smoke_ids)])
+    smoke_rows = []
+    for patient_id in smoke_ids:
+        patient_rows = validation[validation["Patient_ID"] == patient_id]
+        if patient_id in positive_ids[:5]:
+            patient_rows = patient_rows[patient_rows["label"].astype(int) == 1]
+        smoke_rows.append(patient_rows.head(1))
+    smoke = pd.concat(smoke_rows, ignore_index=True)
+    if set(smoke["label"].astype(int)) != {0, 1}:
+        raise RuntimeError("Smoke test precisa conter observações rotuladas 0 e 1")
+    print(f"Smoke test antes da validação completa: {len(smoke_ids)} pacientes, {len(smoke)} observações.", flush=True)
+    smoke_records, token_meta = score_prompts(
+        model, tokenizer, smoke["prompt"], batch_size=int(runtime["batch_size"]),
+        max_length=int(runtime["max_length"]), log=lambda message: print(message, flush=True),
+    )
+    if not all(0.0 <= record["raw_probability"] <= 1.0 for record in smoke_records):
+        raise RuntimeError("Smoke test produziu probabilidade fora de [0, 1]")
+    print(
+        f"Tokenizer: token_id('0')={token_meta['token_id_0']} token_id('1')={token_meta['token_id_1']} "
+        f"sequences={token_meta['token_ids_0']}/{token_meta['token_ids_1']}; "
+        f"logits_shape={token_meta['logits_shape']} last_positions={token_meta['last_relevant_positions']}.",
+        flush=True,
+    )
+    print_smoke_rows(smoke, smoke_records)
+    if args.smoke_only:
+        print("Smoke test concluído; inferência completa e test não foram executados.", flush=True)
+        return
+
+    print("Extraindo logits de 0 e 1 em toda a validation.", flush=True)
     records, token_meta = score_prompts(
         model, tokenizer, validation["prompt"], batch_size=int(runtime["batch_size"]),
         max_length=int(runtime["max_length"]), log=lambda message: print(message, flush=True),
     )
     validation = attach_raw_scores(validation, records)
     print(
-        f"Tokens de classe: 0 -> {token_meta['token_ids_0']}, 1 -> {token_meta['token_ids_1']}.",
+        f"Tokens de classe: token_id('0')={token_meta['token_id_0']}, "
+        f"token_id('1')={token_meta['token_id_1']}; sequences="
+        f"{token_meta['token_ids_0']}/{token_meta['token_ids_1']}; logits_shape={token_meta['logits_shape']}.",
         flush=True,
     )
 
@@ -137,7 +223,47 @@ def main() -> None:
     )
     context = model_context(base_model, args.adapter, token_meta, args.data_dir, seed)
     save_validation_artifacts(args.output_dir, selection, context)
+    manifest = {
+        "model": str(base_model),
+        "adapter": str(args.adapter),
+        "dataset": dataset_version(args.data_dir),
+        "validation_patients": int(validation["Patient_ID"].nunique()),
+        "test_patients": int(len(test_ids)),
+        "calibration_method": selection.calibrator.method,
+        "threshold": float(selection.config["threshold"]),
+        "target_sensitivity": float(selection.config["target_sensitivity"]),
+        "temporal_strategy": selection.config["aggregation_strategy"],
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+    }
+    args.output_dir.mkdir(parents=True, exist_ok=True)
+    (args.output_dir / "run_manifest.json").write_text(
+        json.dumps(manifest, indent=2, ensure_ascii=False) + "\n", encoding="utf-8",
+    )
     print(selection.config["threshold_message"], flush=True)
+    print(
+        "MAXIMUM VALIDATION SENSITIVITY: "
+        f"{selection.config['maximum_validation_sensitivity']:.4f} at "
+        f"threshold={selection.config['maximum_sensitivity_threshold']:.2f}, "
+        f"FP={selection.config['maximum_sensitivity_fp']}, FN={selection.config['maximum_sensitivity_fn']}",
+        flush=True,
+    )
+    print("TEMPORAL STRATEGIES ON VALIDATION:", flush=True)
+    print(selection.strategy_table[[
+        "strategy", "sensitivity", "specificity", "PPV", "NPV", "F1", "FN", "FP",
+        "median_lead_time", "mean_lead_time",
+    ]].to_string(index=False), flush=True)
+    selected_threshold_row = selection.threshold_table.loc[
+        selection.threshold_table.threshold == selection.config["threshold"]
+    ].iloc[0]
+    print(
+        f"Selected threshold={selection.config['threshold']:.2f}; "
+        f"validation sensitivity={selection.config['achieved_sensitivity_validation_hourly']:.4f}; "
+        f"specificity={selection.config['achieved_specificity_validation_hourly']:.4f}; "
+        f"hourly FN={int(selected_threshold_row['FN'])}; hourly FP={int(selected_threshold_row['FP'])}.",
+        flush=True,
+    )
+    if not selection.config["target_met"]:
+        print("WARNING: Target sensitivity of 95% was not achieved.", flush=True)
     print(
         f"Calibrador: {selection.config['method']}. Estratégia: {selection.config['aggregation_strategy']}.",
         flush=True,
@@ -146,10 +272,20 @@ def main() -> None:
         print("A meta de sensibilidade horária não foi atingida na validação.", flush=True)
     if not selection.config["strategy_target_met"]:
         print("A meta de sensibilidade por paciente não foi atingida na validação.", flush=True)
+    print("CALIBRATION METRICS ON VALIDATION:", flush=True)
+    print("Model              Brier       ECE       LogLoss", flush=True)
+    for name, values in selection.calibration_metrics.items():
+        print(f"{name:<18} {values['brier']:.6f}  {values['ece']:.6f}  {values['log_loss']:.6f}", flush=True)
+    print("SANITY SAMPLE AFTER VALIDATION CALIBRATION:", flush=True)
+    print_smoke_rows(smoke, smoke_records, selection.calibrator, float(selection.config["threshold"]))
 
     calibrator, config = load_frozen_decision(args.output_dir)
     print("Validação congelada. O teste passa a ser lido somente para a avaliação final.", flush=True)
     test = load_prepared_split(args.data_dir, "test")
+    assert_disjoint_patient_ids(validation_ids, test["Patient_ID"])
+    if not test.groupby("Patient_ID", sort=False)["Hour"].apply(lambda hours: hours.is_monotonic_increasing).all():
+        raise ValueError("Hour fora de ordem crescente dentro de test")
+    print_split_summary(test, "test")
     test_records, test_tokens = score_prompts(
         model, tokenizer, test["prompt"], batch_size=int(runtime["batch_size"]),
         max_length=int(runtime["max_length"]), log=lambda message: print(message, flush=True),
@@ -158,7 +294,7 @@ def main() -> None:
         raise RuntimeError("Os tokens de classe mudaram entre a validação e o teste.")
     test = attach_raw_scores(test, test_records)
     result = evaluate_test_frame(test, calibrator, config)
-    report = build_final_report(result["metrics"], config, context)
+    report = build_final_report(result["metrics"], config, context, result["hourly_metrics"])
     write_evaluation_artifacts(args.output_dir, result, report)
     print(
         "Teste por paciente: "
@@ -168,6 +304,10 @@ def main() -> None:
         f"lead time mediano={report['median_lead_time']}.",
         flush=True,
     )
+    print("HOURLY EVALUATION:", flush=True)
+    print(json.dumps(result["hourly_metrics"], indent=2, ensure_ascii=False), flush=True)
+    print("PATIENT-LEVEL EVALUATION:", flush=True)
+    print(json.dumps(result["metrics"], indent=2, ensure_ascii=False), flush=True)
     for warning in report["warnings"]:
         print(warning, flush=True)
     print(DISCLAIMER, flush=True)

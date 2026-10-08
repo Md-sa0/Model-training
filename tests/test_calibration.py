@@ -1,9 +1,11 @@
 import json
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 import pandas as pd
 import pytest
+import torch
 from sklearn.metrics import confusion_matrix
 
 from qwen_sepsis.calibration import (
@@ -15,7 +17,12 @@ from qwen_sepsis.calibration import (
 )
 from qwen_sepsis.data import FEATURES, load_prepared_split, prepare_dataset
 from qwen_sepsis.explain import abnormalities_until, build_decision_record, classify_risk
-from qwen_sepsis.patient_evaluation import build_patient_table, select_temporal_strategy, summarize_patient
+from qwen_sepsis.inference import _last_relevant_positions, score_prompts
+from qwen_sepsis.patient_evaluation import (
+    build_patient_table,
+    select_temporal_strategy,
+    summarize_patient,
+)
 from qwen_sepsis.pipeline import (
     REQUIRED_REPORT_KEYS,
     build_final_report,
@@ -43,7 +50,42 @@ class _MultiToken:
 class _SamePrefix:
     def encode(self, text, add_special_tokens=False):
         assert add_special_tokens is False
-        return [7, 8]
+        return {"0": [7, 8], "1": [7, 9]}[text]
+
+
+class _FakeBatch(dict):
+    def to(self, device):
+        return self
+
+    def __getattr__(self, name):
+        return self[name]
+
+
+class _SharedPrefixTokenizer(_SamePrefix):
+    padding_side = "right"
+
+    def apply_chat_template(self, messages, **kwargs):
+        return messages[-1]["content"]
+
+    def __call__(self, texts, **kwargs):
+        input_ids = torch.tensor([[1, 2] for _ in texts])
+        return _FakeBatch(input_ids=input_ids, attention_mask=torch.ones_like(input_ids))
+
+
+class _SequenceScoreModel:
+    device = torch.device("cpu")
+
+    def eval(self):
+        return self
+
+    def __call__(self, input_ids, attention_mask):
+        logits = torch.zeros((*input_ids.shape, 10))
+        if input_ids.shape[1] == 2:
+            logits[:, -1, 7] = 2.0
+        else:
+            logits[:, -1, 8] = 3.0
+            logits[:, -1, 9] = 1.0
+        return SimpleNamespace(logits=logits)
 
 
 def _rows(patient, hours, labels, probabilities):
@@ -89,8 +131,9 @@ def test_probability_is_between_zero_and_one():
     assert sequences == {"0": [15], "1": [16]}
     token_0, token_1, sequences = resolve_binary_token_ids(_MultiToken())
     assert (token_0, token_1, sequences["0"]) == (3, 5, [3, 4])
-    with pytest.raises(ValueError):
-        resolve_binary_token_ids(_SamePrefix())
+    token_0, token_1, sequences = resolve_binary_token_ids(_SamePrefix())
+    assert (token_0, token_1) == (7, 7)
+    assert sequences == {"0": [7, 8], "1": [7, 9]}
 
     labels = np.array([0, 0, 1, 1])
     scores = np.array([0.1, 0.2, 0.8, 0.9])
@@ -101,6 +144,20 @@ def test_probability_is_between_zero_and_one():
 
     source = (Path(__file__).resolve().parents[1] / "src" / "qwen_sepsis" / "inference.py").read_text(encoding="utf-8")
     assert ".generate(" not in source
+
+
+def test_last_relevant_logit_position_respects_padding_side():
+    right_mask = torch.tensor([[1, 1, 0], [1, 1, 1]])
+    left_mask = torch.tensor([[0, 1, 1], [1, 1, 1]])
+    assert _last_relevant_positions(right_mask, "right").tolist() == [1, 2]
+    assert _last_relevant_positions(left_mask, "left").tolist() == [2, 2]
+
+
+def test_multitoken_classes_with_shared_prefix_use_full_sequence_probability():
+    records, metadata = score_prompts(_SequenceScoreModel(), _SharedPrefixTokenizer(), ["sample"])
+    assert metadata["single_token_labels"] is False
+    assert metadata["token_id_0"] == metadata["token_id_1"] == 7
+    assert records[0]["raw_probability"] == pytest.approx(1 / (1 + np.exp(2)), abs=1e-6)
 
 
 def test_calibrator_is_fit_only_on_validation():
@@ -181,11 +238,18 @@ def test_test_split_does_not_modify_calibrator(tmp_path):
     else:
         assert all(np.allclose(left, right) for left, right in zip(before, after, strict=True))
     assert (tmp_path / "calibration" / "config.json").read_text(encoding="utf-8") == config_text
-    report = build_final_report(result["metrics"], config, context)
+    report = build_final_report(result["metrics"], config, context, result["hourly_metrics"])
     write_evaluation_artifacts(tmp_path, result, report)
     assert report["threshold"] == pytest.approx(config["threshold"])
     assert report["calibration_method"] == config["method"]
     assert report["evaluation_unit"] == "patient"
+    assert report["prediction_unit"] == "hourly observation"
+    assert report["hourly_evaluation"]["evaluation_unit"] == "hourly observation"
+    assert len(result["table"]) == result["table"]["Patient_ID"].nunique()
+    assert {
+        "ground_truth", "prediction", "max_calibrated_probability", "first_alert_hour",
+        "last_alert_hour", "number_of_alerts", "reference_event_hour", "lead_time",
+    }.issubset(result["table"].columns)
     assert report["test_used_for_fitting"] is False
     for key in REQUIRED_REPORT_KEYS:
         assert key in report
@@ -199,6 +263,7 @@ def test_test_split_does_not_modify_calibrator(tmp_path):
         "evaluation/final_patient_metrics.csv",
         "evaluation/patient_confusion_matrix.png",
         "evaluation/patient_predictions.csv",
+        "evaluation/hourly_metrics.csv",
     ]
     for relative in expected:
         artifact = tmp_path / relative
@@ -263,6 +328,8 @@ def test_persistence_of_two_and_three_hours():
     assert two["patient_prediction"] == 1
     assert two["first_alert_hour"] == 1
     assert two["persistent_positive_hours"] == 2
+    assert two["last_alert_hour"] == 1
+    assert two["number_of_alerts"] == 1
 
     broken = summarize_patient(_rows("p", [0, 1, 2], [1, 1, 1], [0.9, 0.1, 0.9]), 0.5, "persist_2h")
     assert broken["patient_prediction"] == 0
@@ -328,17 +395,39 @@ def test_threshold_meets_target_sensitivity_when_possible():
     assert "Achieved sensitivity:" in info["message"]
     assert "Selected threshold:" in info["message"]
 
-    failed, failed_table = select_threshold(
+    zero_threshold, zero_threshold_table = select_threshold(
         np.array([1, 1, 1, 1, 0, 0, 0, 0]),
         np.array([0.0, 0.0, 0.0, 0.2, 0.9, 0.9, 0.9, 0.9]),
         target_sensitivity=0.95,
         split="validation",
     )
-    assert failed["target_met"] is False
-    assert failed["achieved_sensitivity"] == pytest.approx(failed_table["sensitivity"].max())
-    assert failed["achieved_sensitivity"] == pytest.approx(0.25)
-    assert failed["threshold"] == pytest.approx(0.20)
-    assert "Nenhum limiar" in failed["message"]
+    assert zero_threshold["target_met"] is True
+    assert zero_threshold["achieved_sensitivity"] == pytest.approx(1.0)
+    assert zero_threshold["threshold"] == pytest.approx(0.0)
+    assert zero_threshold_table.iloc[0]["FP"] == 4
+    assert zero_threshold_table.iloc[0]["FN"] == 0
+    assert zero_threshold["threshold"] == pytest.approx(zero_threshold_table.iloc[0]["threshold"])
+
+
+def test_nonzero_threshold_grid_uses_specificity_and_reports_error_rates():
+    labels = np.array([1, 1, 0, 0])
+    probabilities = np.array([0.10, 0.20, 0.03, 0.04])
+    info, table = select_threshold(
+        labels, probabilities, target_sensitivity=0.95, split="validation",
+        thresholds=np.array([0.01, 0.02, 0.03, 0.04, 0.05, 0.10, 0.20]),
+    )
+    assert info["threshold"] == pytest.approx(0.10)
+    assert info["threshold"] > 0.0
+    assert info["target_met"] is True
+    selected = table.loc[table["threshold"] == info["threshold"]].iloc[0]
+    assert selected["TP"] == 2
+    assert selected["TN"] == 2
+    assert selected["FP"] == 0
+    assert selected["FN"] == 0
+    assert selected["sensitivity"] == pytest.approx(1.0)
+    assert selected["specificity"] == pytest.approx(1.0)
+    assert selected["false_positive_rate"] == pytest.approx(0.0)
+    assert selected["false_negative_rate"] == pytest.approx(0.0)
 
 
 def test_risk_levels_follow_configured_cuts():

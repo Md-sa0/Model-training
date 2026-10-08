@@ -24,12 +24,14 @@ from .patient_evaluation import (
     _labels,
     compare_temporal_strategies,
     evaluate_patients,
+    hourly_evaluation,
     select_temporal_strategy,
     strategy_fields,
 )
 from .plotting import save_calibration_curve, save_confusion_matrix, save_threshold_curve
 
 REQUIRED_REPORT_KEYS = [
+    "prediction_unit",
     "evaluation_unit",
     "calibration_method",
     "threshold",
@@ -129,6 +131,11 @@ def select_from_validation(frame: pd.DataFrame, target_sensitivity: float, seed:
             "mean_lead_time", "n_undetected",
         )
     }
+    maximum_sensitivity = threshold_table.sort_values(
+        ["sensitivity", "specificity", "threshold"],
+        ascending=[False, False, False],
+        kind="mergesort",
+    ).iloc[0]
     config = {
         "method": calibrator.method,
         "threshold": threshold_info["threshold"],
@@ -136,6 +143,10 @@ def select_from_validation(frame: pd.DataFrame, target_sensitivity: float, seed:
         "target_met": threshold_info["target_met"],
         "achieved_sensitivity_validation_hourly": threshold_info["achieved_sensitivity"],
         "achieved_specificity_validation_hourly": threshold_info["achieved_specificity"],
+        "maximum_validation_sensitivity": float(maximum_sensitivity["sensitivity"]),
+        "maximum_sensitivity_threshold": float(maximum_sensitivity["threshold"]),
+        "maximum_sensitivity_fp": int(maximum_sensitivity["FP"]),
+        "maximum_sensitivity_fn": int(maximum_sensitivity["FN"]),
         "threshold_message": threshold_info["message"],
         **strategy_fields(chosen_strategy["strategy"]),
         "strategy_target_met": chosen_strategy["target_met"],
@@ -226,7 +237,15 @@ def evaluate_test_frame(frame: pd.DataFrame, calibrator: FrozenCalibrator, confi
         risk_levels=config["risk_levels"],
         trend_delta=float(config["trend_delta"]),
     )
-    return {"table": table, "metrics": metrics, "decisions": decisions, "frame": work}
+    if len(table) != work["Patient_ID"].nunique():
+        raise RuntimeError("A avaliação por paciente não contém exatamente uma linha por Patient_ID único")
+    return {
+        "table": table,
+        "metrics": metrics,
+        "hourly_metrics": hourly_evaluation(work, float(config["threshold"])),
+        "decisions": decisions,
+        "frame": work,
+    }
 
 
 def _same_parameters(left, right) -> bool:
@@ -235,12 +254,16 @@ def _same_parameters(left, right) -> bool:
     return all(np.allclose(first, second) for first, second in zip(left, right, strict=True))
 
 
-def build_final_report(metrics: dict, config: dict, context: dict) -> dict:
+def build_final_report(metrics: dict, config: dict, context: dict, hourly_metrics: dict | None = None) -> dict:
     report = {
+        "prediction_unit": "hourly observation",
         "evaluation_unit": "patient",
         "split": "test",
         "calibration_method": config["method"],
         "threshold": float(config["threshold"]),
+        "maximum_validation_sensitivity": float(config["maximum_validation_sensitivity"]),
+        "maximum_sensitivity_threshold": float(config["maximum_sensitivity_threshold"]),
+        "maximum_sensitivity_fp": int(config["maximum_sensitivity_fp"]),
         "target_sensitivity": float(config["target_sensitivity"]),
         "aggregation_strategy": config["aggregation_strategy"],
         "persistence_hours": config["persistence_hours"],
@@ -262,6 +285,8 @@ def build_final_report(metrics: dict, config: dict, context: dict) -> dict:
         "true_negatives": metrics["true_negatives"],
         "mean_lead_time": metrics["mean_lead_time"],
         "median_lead_time": metrics["median_lead_time"],
+        "minimum_lead_time": metrics["minimum_lead_time"],
+        "maximum_lead_time": metrics["maximum_lead_time"],
         "pct_detected_6h_before": metrics["pct_detected_6h_before"],
         "pct_detected_12h_before": metrics["pct_detected_12h_before"],
         "pct_detected_24h_before": metrics["pct_detected_24h_before"],
@@ -269,17 +294,22 @@ def build_final_report(metrics: dict, config: dict, context: dict) -> dict:
         "n_patients": metrics["n_patients"],
         "n_sepsis_patients": metrics["n_sepsis_patients"],
         "n_detected": metrics["n_detected"],
+        "patients_not_detected": metrics["n_undetected"],
         "false_alarms_per_patient": metrics["false_alarms_per_patient"],
         "patients_with_hour_gaps": metrics["patients_with_hour_gaps"],
         "confusion_matrix": metrics["confusion_matrix"],
-        "hourly_brier_score": metrics["hourly_brier_score"],
-        "hourly_ece": metrics["hourly_ece"],
-        "hourly_log_loss": metrics["hourly_log_loss"],
+        "hourly_brier_score": metrics.get("hourly_brier_score"),
+        "hourly_ece": metrics.get("hourly_ece"),
+        "hourly_log_loss": metrics.get("hourly_log_loss"),
+        "hourly_evaluation": hourly_metrics,
         "validation_selection": {
             "threshold_message": config["threshold_message"],
             "target_met": config["target_met"],
             "achieved_sensitivity_hourly": config["achieved_sensitivity_validation_hourly"],
             "achieved_specificity_hourly": config["achieved_specificity_validation_hourly"],
+            "maximum_sensitivity": config["maximum_validation_sensitivity"],
+            "maximum_sensitivity_threshold": config["maximum_sensitivity_threshold"],
+            "maximum_sensitivity_false_positives": config["maximum_sensitivity_fp"],
             "strategy_target_met": config["strategy_target_met"],
             "strategy_description": config["strategy_description"],
             "calibration_comparison": config["calibration_comparison"],
@@ -312,6 +342,17 @@ def build_final_report(metrics: dict, config: dict, context: dict) -> dict:
         warnings.append(
             "A sensibilidade no teste ficou abaixo da meta definida na validação. O limiar não foi reajustado."
         )
+    if float(config["threshold"]) <= 0.0 or float(config["achieved_specificity_validation_hourly"]) == 0.0:
+        warnings.append(
+            "WARNING: A meta de sensibilidade foi alcançada na validação somente com threshold zero ou "
+            "especificidade zero; isso gera falsos positivos em todas as observações sem sepse. "
+            f"FP horários na validação={config['maximum_sensitivity_fp']}."
+        )
+    if report["specificity"] == 0.0 and report["false_positives"]:
+        warnings.append(
+            "WARNING: A avaliação por paciente no test teve especificidade zero: "
+            f"{report['false_positives']} de {report['n_patients'] - report['n_sepsis_patients']} pacientes sem sepse foram sinalizados."
+        )
     report["limitations"] = limitations
     report["warnings"] = warnings
     return json_ready(report)
@@ -321,7 +362,9 @@ def _predictions_frame(table: pd.DataFrame) -> pd.DataFrame:
     columns = [
         "Patient_ID", "has_sepsis", "max_risk", "first_alert_hour", "persistent_positive_hours",
         "patient_prediction", "false_negative", "false_positive", "onset_hour", "lead_time",
-        "persistent_alert_hours", "hours_above_threshold", "false_alarm_hours", "hour_gap",
+        "ground_truth", "prediction", "max_calibrated_probability", "last_alert_hour", "number_of_alerts",
+        "reference_event_hour", "persistent_alert_hours",
+        "hours_above_threshold", "false_alarm_hours", "hour_gap",
         "current_hour", "current_probability",
     ]
     out = table[[column for column in columns if column in table.columns]].copy()
@@ -341,6 +384,7 @@ def write_evaluation_artifacts(output_dir: Path, result: dict, report: dict) -> 
     scalar = {key: value for key, value in report.items() if not isinstance(value, (dict, list))}
     pd.DataFrame([scalar]).to_csv(evaluation_dir / "final_patient_metrics.csv", index=False)
     _predictions_frame(result["table"]).to_csv(evaluation_dir / "patient_predictions.csv", index=False)
+    pd.DataFrame([json_ready(result["hourly_metrics"])]).to_csv(evaluation_dir / "hourly_metrics.csv", index=False)
     save_confusion_matrix(
         evaluation_dir / "patient_confusion_matrix.png",
         result["table"]["has_sepsis"],

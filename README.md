@@ -110,7 +110,21 @@ Depois:
 python scripts/run_calibration.py
 ```
 
-A meta padrão é 95% de sensibilidade. Ela fica em `configs/calibration.json`. O teste não ajusta calibrador, limiar nem regra temporal. Os artefatos ficam em `artifacts/calibration` e `artifacts/evaluation`.
+A meta inicial é 95% de sensibilidade e fica em `configs/calibration.json`. O calibrador e o threshold são escolhidos somente na validation; o test é aberto depois que ambos estão congelados. Os artefatos ficam em `artifacts/calibration`, `artifacts/evaluation` e `artifacts/decision`.
+
+Para regenerar os relatórios a partir dos scores persistidos, sem carregar o Qwen nem recalibrar:
+
+```powershell
+python scripts/finalize_decision.py
+```
+
+Para pontuar uma observação clínica atual com o Qwen e a decisão congelada, use Python 3.12, GPU CUDA e o exemplo sintético:
+
+```powershell
+python scripts/demo_patient.py --input configs/demo_patient_example.json
+```
+
+Os campos omitidos são imputados pelas medianas do treino; dados dinâmicos ausentes são marcados no prompt. A resposta é risco binário de suporte à decisão, não diagnóstico. A avaliação atual não alcança sensibilidade horária de 95%; a avaliação patient-level com a regra `any_alert` ainda tem especificidade zero, portanto este CLI é somente demonstração acadêmica.
 
 O resultado é um sistema experimental de apoio à decisão para previsão precoce de risco de sepse. Não substitui o diagnóstico médico.
 

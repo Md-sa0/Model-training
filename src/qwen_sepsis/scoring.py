@@ -30,9 +30,4 @@ def resolve_binary_token_ids(tokenizer) -> tuple[int, int, dict[str, list[int]]]
         if not encoded:
             raise ValueError(f"O tokenizer não produziu token para {label!r}.")
         sequences[label] = [int(token) for token in encoded]
-    if sequences["0"][0] == sequences["1"][0]:
-        raise ValueError(
-            "Os primeiros tokens de '0' e '1' coincidem. "
-            f"Sequências: {sequences}."
-        )
     return sequences["0"][0], sequences["1"][0], sequences

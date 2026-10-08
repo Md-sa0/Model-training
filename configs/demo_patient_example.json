@@ -1,0 +1,17 @@
+{
+  "patient_id": "demo-001",
+  "HR": 108,
+  "O2Sat": 95,
+  "Temp": 38.1,
+  "SBP": 102,
+  "MAP": 70,
+  "DBP": 58,
+  "Resp": 23,
+  "WBC": 13.2,
+  "Lactate": 2.4,
+  "Creatinine": 1.1,
+  "Platelets": 172,
+  "Age": 67,
+  "Gender": 1,
+  "ICULOS": 18
+}

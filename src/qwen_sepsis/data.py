@@ -89,6 +89,22 @@ def _sample_rows(df: pd.DataFrame, max_rows: int | None, seed: int, negative_rat
     return df
 
 
+def _sample_eval_patients(df: pd.DataFrame, max_rows: int | None, seed: int) -> pd.DataFrame:
+    if max_rows is None or len(df) <= max_rows:
+        return df
+    patient_ids = df["Patient_ID"].drop_duplicates().to_numpy(copy=True)
+    np.random.default_rng(seed).shuffle(patient_ids)
+    patient_sizes = df.groupby("Patient_ID", sort=False).size()
+    selected = []
+    selected_rows = 0
+    for patient_id in patient_ids:
+        if selected_rows >= max_rows:
+            break
+        selected.append(patient_id)
+        selected_rows += int(patient_sizes.loc[patient_id])
+    return df[df["Patient_ID"].isin(selected)]
+
+
 def format_prompt(row: pd.Series) -> str:
     values = ", ".join(f"{name}={float(row[name]):.4g}" for name in FEATURES)
     missing = ", ".join(name for name in DYNAMIC if int(row[f"{name}_missing"]) == 1) or "nenhuma"
@@ -126,6 +142,27 @@ def hour_value(value) -> int:
     return int(round(number))
 
 
+def assert_disjoint_patient_ids(validation_ids, test_ids) -> None:
+    validation = {normalize_patient_id(value) for value in validation_ids}
+    test = {normalize_patient_id(value) for value in test_ids}
+    overlap = validation.intersection(test)
+    if overlap:
+        sample = sorted(overlap)[:10]
+        raise ValueError(
+            f"Patient_ID aparece em validation e test ({len(overlap)} pacientes): {sample}"
+        )
+
+
+def load_patient_ids(data_dir: Path, split: str) -> set[str]:
+    index_path = Path(data_dir) / f"{split}_patients.jsonl"
+    if not index_path.exists():
+        raise FileNotFoundError(f"Índice de pacientes ausente: {index_path}")
+    index = pd.read_json(index_path, lines=True)
+    if "Patient_ID" not in index.columns or index["Patient_ID"].isna().any():
+        raise ValueError(f"Patient_ID ausente ou nulo no índice {split}: {index_path}")
+    return set(index["Patient_ID"].map(normalize_patient_id))
+
+
 def _index_value(column: str, value):
     if column == "Patient_ID":
         return normalize_patient_id(value)
@@ -158,6 +195,11 @@ def prepare_dataset(raw_path: Path, output_dir: Path, seed: int = 42, train_nega
         source = source.drop(columns="Unnamed: 0")
     source, invalid_rows = validate(source)
     assignment = patient_split(source, seed)
+    split_patients = {
+        split: {patient_id for patient_id, assigned_split in assignment.items() if assigned_split == split}
+        for split in ("train", "validation", "test")
+    }
+    assert_disjoint_patient_ids(split_patients["validation"], split_patients["test"])
     work = source[["Patient_ID", "Hour", *FEATURES, "SepsisLabel"]].copy()
     work["split"] = work.Patient_ID.map(assignment)
     work = temporal_fill(work)
@@ -168,7 +210,11 @@ def prepare_dataset(raw_path: Path, output_dir: Path, seed: int = 42, train_nega
     counts: dict[str, object] = {}
     for split in ["train", "validation", "test"]:
         part = work[work.split == split]
-        part = _sample_rows(part, max_train if split == "train" else max_eval, seed, train_negative_ratio if split == "train" else None)
+        if split == "train":
+            part = _sample_rows(part, max_train, seed, train_negative_ratio)
+        else:
+            part = _sample_eval_patients(part, max_eval, seed)
+            part = part.sort_values(["Patient_ID", "Hour"], kind="stable")
         write_jsonl(part, output_dir / f"{split}.jsonl")
         write_patient_index(part, output_dir / f"{split}_patients.jsonl")
         counts[split] = {"rows": len(part), "positive": int(part.SepsisLabel.sum()), "prevalence": float(part.SepsisLabel.mean())}
@@ -217,5 +263,12 @@ def load_prepared_split(data_dir: Path, split: str) -> pd.DataFrame:
         raise ValueError(f"SepsisLabel não coincide com label em {split}")
     frame["Patient_ID"] = frame["Patient_ID"].map(normalize_patient_id)
     frame["Hour"] = frame["Hour"].map(hour_value)
+    if frame[["Patient_ID", "Hour"]].isna().any().any():
+        raise ValueError(f"Patient_ID ou Hour ausente em {split}")
+    if frame.duplicated(["Patient_ID", "Hour"]).any():
+        raise ValueError(f"Hora duplicada para o mesmo paciente em {split}")
+    frame = frame.sort_values(["Patient_ID", "Hour"], kind="stable").reset_index(drop=True)
+    if not frame.groupby("Patient_ID", sort=False)["Hour"].apply(lambda hours: hours.is_monotonic_increasing).all():
+        raise ValueError(f"Hour fora de ordem crescente dentro do paciente em {split}")
     return frame
 
