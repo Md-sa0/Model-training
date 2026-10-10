@@ -1,153 +1,213 @@
-# Treinamento do Qwen3 8B para classificação horária de sepse
+# Qwen3-8B para suporte à decisão de risco de sepse
 
-Projeto acadêmico que transforma sinais vitais e exames tabulares em prompts curtos e ajusta o modelo oficial [`Qwen/Qwen3-8B`](https://huggingface.co/Qwen/Qwen3-8B) por QLoRA. O objetivo experimental é prever o rótulo horário `SepsisLabel` como `0` ou `1`.
+Este repositório implementa uma pipeline de decisão operacional baseada em um modelo já treinado, sem alterar pesos do Qwen3-8B nem o adapter LoRA. A ideia central é: entrada clínica atual do paciente -> prompt do modelo -> score bruto -> calibração -> risco probabilístico -> limiar final -> decisão de suporte à decisão.
 
-O modelo não produz diagnóstico, recomendação terapêutica ou explicação clínica. O dataset é um espelho incompleto do PhysioNet 2019, sem proveniência e licença claramente documentadas. Dados brutos, dados processados, pesos do Qwen e adapters estão excluídos do Git.
+A solução é experimental, acadêmica e não substitui diagnóstico médico. Ela tem como objetivo demonstrar a etapa de decisão final sobre risco futuro de sepse usando o modelo preservado, sem novo treinamento e sem re-tuning do adapter.
 
-## Por que QLoRA
+## Objetivo do projeto
 
-O Qwen3 8B possui aproximadamente 8,2 bilhões de parâmetros. Os pesos BF16 ocupam cerca de 16 GB antes das ativações e do otimizador. A RTX 5060 Ti de 16 GB usada neste projeto exige carregamento NF4 em 4 bits, LoRA, batch 1 e gradient checkpointing.
+O objetivo desta etapa foi finalizar a parte operativa do sistema:
 
-## Preparação no Windows
+- manter o modelo base `Qwen/Qwen3-8B` intacto;
+- usar o adapter já treinado em `models/qwen3-8b-sepsis-lora/final_adapter`;
+- inferir um score para cada observação do paciente;
+- calibrar esse score somente na validação;
+- escolher um limiar de decisão na validação;
+- congelar calibrador e threshold antes de abrir o teste;
+- produzir uma demonstração em que o médico informa os dados atuais e recebe um risco estimado.
 
-Use Python 3.12. No PowerShell:
+## Arquitetura real implementada
 
-```powershell
-py -3.12 -m venv .venv
-.\.venv\Scripts\Activate.ps1
-python -m pip install --upgrade pip
-python -m pip install torch --index-url https://download.pytorch.org/whl/cu128
-python -m pip install -r requirements-gpu.txt
-python -m pip install -e . --no-deps
-```
+### 1) Base do modelo e adapter
 
-Confirme a GPU:
+- Modelo base: `models/base/Qwen3-8B`
+- Adapter final: `models/qwen3-8b-sepsis-lora/final_adapter`
+- Framework principal: Transformers + PEFT + quantização 4-bit (BitsAndBytes/QLoRA)
+- A arquitetura não foi alterada para criar um classificador novo. O modelo continua sendo um LLM causal usado para gerar um score de probabilidade a partir de logits dos tokens `0` e `1`.
 
-```powershell
-python -c "import torch; print(torch.cuda.is_available(), torch.cuda.get_device_name(0), torch.cuda.is_bf16_supported())"
-```
+### 2) Pipeline de dados
 
-## Tratamento dos dados
+O pré-processamento fica em:
 
-```powershell
-python -m qwen_sepsis.prepare
-```
+- `src/qwen_sepsis/prepare.py`
+- `src/qwen_sepsis/data.py`
 
-O pipeline:
+A etapa prepara o dataset em três fases:
 
-1. baixa uma revisão fixa do CSV e valida SHA-256;
-2. remove uma linha final incompleta;
-3. separa pacientes em treino, validação e teste;
-4. cria máscaras de ausência antes da imputação;
-5. usa somente a última medida das seis horas anteriores;
-6. calcula medianas somente no treino;
-7. limita o treino a 40 mil exemplos com proporção de três negativos por positivo;
-8. preserva a prevalência natural nas amostras de validação e teste.
+1. baixa um snapshot fixo do dataset e valida a integridade;
+2. separa pacientes em treino, validação e teste;
+3. monta prompts com as últimas medidas das seis horas anteriores;
+4. aplica imputação por mediana do treino;
+5. preserva a prevalência natural nas partições de validação e teste.
 
-O balanceamento é aplicado somente ao treino. As saídas ficam em `data/processed` e não são versionadas.
+O treinamento foi usado apenas para produzir o adapter original; o presente projeto não re-treina o modelo, não ajusta o LoRA e não altera pesos.
 
-## Download do modelo
+### 3) Inferência e pontuação
 
-O download completo requer aproximadamente 17 GB livres em disco:
+A inferência está em:
 
-```powershell
-python -m qwen_sepsis.download_model
-```
+- `src/qwen_sepsis/inference.py`
+- `src/qwen_sepsis/explain.py`
 
-Os arquivos ficam em `models/base/Qwen3-8B`. Também é possível omitir o download e deixar o Transformers usar o cache do Hugging Face.
+A lógica do score é:
 
-## Teste rápido do treinamento
+1. o prompt contendo sinais vitais e exames do paciente é enviado ao Qwen;
+2. o modelo produz logits para os tokens 0 e 1;
+3. a probabilidade bruta é inferida via softmax sobre os logits desses tokens;
+4. o score bruto é transformado em probabilidade calibrada.
 
-Execute primeiro dois passos com 32 exemplos:
+### 4) Calibração e limiar de decisão
 
-```powershell
-python -m qwen_sepsis.train --model-path models/base/Qwen3-8B --smoke
-```
+A etapa de decisão final está em:
 
-Monitore a VRAM em outro terminal:
+- `src/qwen_sepsis/calibration.py`
+- `src/qwen_sepsis/patient_evaluation.py`
+- `src/qwen_sepsis/pipeline.py`
 
-```powershell
-nvidia-smi -l 2
-```
+O fluxo é:
 
-## Treinamento completo
+- `score bruto` -> `calibrador` -> `risk score`
+- `risk score` -> `threshold` -> decisão
 
-```powershell
-python -m qwen_sepsis.train --model-path models/base/Qwen3-8B
-```
+A regra de seleção foi:
 
-O adapter é salvo em `models/qwen3-8b-sepsis-lora/final_adapter`. Interromper e reiniciar o treinamento ainda não retoma checkpoints automaticamente.
+- ajustar o calibrador apenas na validação;
+- comparar `raw`, `platt` e `isotonic` por Brier, ECE e log loss;
+- escolher o melhor calibrador na validação;
+- escolher o limiar também na validação;
+- congelar ambos antes de avaliar o teste.
 
-## Resultados do treinamento
+O calibrador final selecionado foi `isotonic`, conforme o melhor desempenho em Brier/ECE/log loss na validação. O limiar escolhido foi `0.01`.
 
-O treinamento completou 1 época com loss de `0.24124`, em `69,740.4645` segundos. A velocidade média foi de `0.475` amostras/s (`0.03` passos/s), com `3.2076e17` FLOPs totais. Os valores completos estão em [`reports/train_metrics.json`](reports/train_metrics.json).
+### 5) Regra de decisão operacional
 
-A avaliação final ainda está pendente; portanto, estes resultados não incluem métricas de validação ou teste.
+A decisão atual implementada no projeto é uma decisão binária de suporte à decisão:
 
-## Avaliação
+- `risk_score >= threshold` => risco elevado
+- `risk_score < threshold` => baixo risco
 
-```powershell
-python -m qwen_sepsis.evaluate `
-  --base-model models/base/Qwen3-8B `
-  --adapter models/qwen3-8b-sepsis-lora/final_adapter
-```
+Em termos de arquitetura, o sistema é concebido como uma pipeline de risco futuro, mas a implementação executável do demo atual expõe apenas dois estados, não uma triagem clínica formal em três faixas validadas.
 
-O limiar é escolhido pela maior F1 na validação e aplicado uma única vez ao teste. As métricas são salvas em `outputs/evaluation.json`. Esse comando continua sendo a avaliação horária.
+### 6) Avaliação por paciente
 
-## Calibração e avaliação por paciente
+A avaliação por paciente e a agregação das alertas horários são feitas em:
 
-O protocolo abaixo não retreina o Qwen. Ele lê os logits dos tokens `0` e `1`, calibra na validação, escolhe um limiar de alta sensibilidade e só então avalia o teste por paciente.
+- `src/qwen_sepsis/patient_evaluation.py`
 
-Se os dados foram preparados antes deste protocolo, gere o índice de pacientes. O jsonl de treino continua só com `prompt` e `label`:
+A regra usada para paciente foi `any_alert`, isto é: se qualquer hora do paciente excedeu o limiar durante o intervalo relevante, o paciente é marcado como positivo para a regra de avaliação por paciente.
 
-```powershell
-python -m qwen_sepsis.prepare
-```
+Essa agregação é importante para contextualizar o problema, mas também revela uma limitação clínica e estatística importante: a estratégia de paciente otimiza detecção de alertas, mas não garante especificidade operacional aceitável.
 
-Depois:
+## Estado real do desempenho
 
-```powershell
-python scripts/run_calibration.py
-```
+Os artefatos finais foram gravados em `artifacts/decision` e refletem o comportamento congelado do sistema.
 
-A meta inicial é 95% de sensibilidade e fica em `configs/calibration.json`. O calibrador e o threshold são escolhidos somente na validation; o test é aberto depois que ambos estão congelados. Os artefatos ficam em `artifacts/calibration`, `artifacts/evaluation` e `artifacts/decision`.
+### Seleção do calibrador e limiar
 
-Para regenerar os relatórios a partir dos scores persistidos, sem carregar o Qwen nem recalibrar:
+- calibrador escolhido: `isotonic`
+- threshold final: `0.01`
+- treino e ajuste: nenhum, apenas na validação
+- teste usado para ajuste: `false`
 
-```powershell
-python scripts/finalize_decision.py
-```
+### Métrica de validação mais relevante
 
-Para pontuar uma observação clínica atual com o Qwen e a decisão congelada, use Python 3.12, GPU CUDA e o exemplo sintético:
+Na validação, para o limiar final `0.01`:
+
+- sensibilidade: `0.9424`
+- especificidade: `0.3189`
+
+Esse resultado representa o melhor compromisso encontrado, mas não atende ao alvo de 95% de sensibilidade com especificidade suficiente. A mensagem do artefato indica explicitamente que nenhum threshold atingiu o requisito mínimo de sensibilidade com uma regra de decisão útil.
+
+### Métrica por paciente
+
+A avaliação por paciente usando `any_alert` foi reportada como:
+
+- sensibilidade: `1.0`
+- especificidade: `0.0`
+
+Isso mostra que a regra de paciente detecta todos os pacientes de risco, mas também gera um número muito grande de falsos positivos. Esse é um ponto crítico para interpretação.
+
+## Demonstração operacional
+
+A demonstração de um paciente atual usa:
 
 ```powershell
 python scripts/demo_patient.py --input configs/demo_patient_example.json
 ```
 
-Os campos omitidos são imputados pelas medianas do treino; dados dinâmicos ausentes são marcados no prompt. A resposta é risco binário de suporte à decisão, não diagnóstico. A avaliação atual não alcança sensibilidade horária de 95%; a avaliação patient-level com a regra `any_alert` ainda tem especificidade zero, portanto este CLI é somente demonstração acadêmica.
+Esse comando:
 
-O resultado é um sistema experimental de apoio à decisão para previsão precoce de risco de sepse. Não substitui o diagnóstico médico.
+- lê os dados do paciente;
+- imputa valores ausentes usando medianas do treino;
+- monta o prompt;
+- carrega o modelo base + adapter final;
+- calcula o score bruto;
+- aplica o calibrador frozen;
+- compara com o threshold frozen;
+- imprime o risco estimado e a mensagem de apoio à decisão.
 
-## Testes de software
+A saída é um diagnóstico de apoio à decisão e não um diagnóstico médico. A mensagem de disclaimer está incluída na resposta.
 
-Os testes não baixam o Qwen nem o dataset real:
+## Limitações do trabalho
+
+### 1) Não é um sistema clínico validado
+
+Este projeto é um protótipo acadêmico. Não foi validado em ambiente clínico, não foi testado em outra instituição e não deve ser usado para tomada de decisão médica real.
+
+### 2) Não há garantia de sensibilidade e especificidade operacionais
+
+O limiar final não alcançou a meta de 95% de sensibilidade com especificidade aceitável. O melhor compromisso ficou em `0.9424` de sensibilidade e `0.3189` de especificidade na validação.
+
+### 3) A regra de paciente tem desempenho muito frágil
+
+A regra `any_alert` produz sensibilidade total, mas especificidade zero, o que indica um alto volume de falsos positivos. Em termos práticos, isso significa que o sistema é sensível a sinais de risco, mas também dispara alertas excessivos.
+
+### 4) O problema de sepse e o rótulo são intrinsecamente ambíguos
+
+O rótulo de sepse do desafio começa antes do início da janela clínica usada no problema e permanece positivo durante um intervalo. Isso torna a tarefa mais próxima de uma previsão temporal ambígua do que de uma detecção estritamente binária em um instante fixo.
+
+### 5) O uso de LLM para dados tabulares é experimental
+
+A abordagem usa um modelo generativo em um problema tabular; isso é válido como experimento e como prova de conceito, mas não equivale a uma solução madura de risco clínico. O benchmark tabular específico do problema continua sendo uma referência mais apropriada para comparação.
+
+### 6) O conjunto de dados e o contexto de treinamento não garantem generalização
+
+A base de dados é um espelho do dataset do PhysioNet Challenge 2019 e o projeto usa uma divisão por paciente e prompt específico com medianas do treino. Isso não elimina vieses de hospital, população, qualidade de coleta e convenções de anotação.
+
+### 7) O projeto não produz um sistema de três níveis de risco validado
+
+A arquitetura conceitual de `baixo / intermediário / alto risco` é útil para discussão e apresentação, mas a implementação realmente executável do código final ainda usa uma decisão binária congelada. O regime em três níveis ainda não foi validado com critérios clínicos e estatísticos suficientes.
+
+## Testes e validação de software
+
+Os testes automatizados do repositório são executados com:
 
 ```powershell
 python -m pytest -v
 ```
 
-Eles verificam divisão por paciente, ausência de informação futura, limite temporal de seis horas, validação estrutural, ausência do alvo no prompt e criação dos arquivos processados.
+Eles cobrem a divisão por paciente, ausência de informação futura, janela temporal de seis horas, integridade dos dados e geração dos artefatos processados. Não há testes para validade clínica.
 
-## Limitações
+## Estrutura principal do repositório
 
-- O rótulo do desafio começa antes do início definido e permanece positivo; a classificação de todas as horas não mede exclusivamente antecipação em seis horas.
-- O uso de um LLM para dados tabulares é experimental. O benchmark tabular do repositório `predicao-precoce-sepse` deve permanecer como comparação.
-- O treino balanceado altera a distribuição vista pelo modelo. A avaliação horária usa prevalência natural. A calibração e o limiar de alta sensibilidade são definidos só na validação, em `scripts/run_calibration.py`.
-- A validação clínica exige outra instituição, revisão das unidades e análise por paciente, hospital e subgrupos.
+- `configs/` — configurações do calibrador e do exemplo de demonstração
+- `data/processed/` — dados já preparados
+- `models/base/Qwen3-8B/` — base model
+- `models/qwen3-8b-sepsis-lora/final_adapter/` — adapter salvo
+- `src/qwen_sepsis/` — código principal do projeto
+- `scripts/` — scripts de calibração, decisão e demonstração
+- `artifacts/` — artefatos finais, relatórios e métricas
+- `reports/` — métricas de treinamento
 
 ## Referências
 
 - [Qwen3 8B oficial](https://huggingface.co/Qwen/Qwen3-8B)
-- [Quantização com PEFT](https://huggingface.co/docs/peft/developer_guides/quantization)
+- [PEFT / quantização](https://huggingface.co/docs/peft/developer_guides/quantization)
 - [PhysioNet Challenge 2019](https://physionet.org/content/challenge-2019/1.0.0/)
+
+## Conclusão
+
+Este repositório finaliza a etapa de decisão de risco de sepse sobre o modelo já treinado, sem treinar de novo nem trocar pesos. O trabalho demonstra um fluxo operacional completo de apoio à decisão, com calibrador e limiar congelados e com uma CLI de teste para observação atual do paciente.
+
+O que está concluído é a cadeia de decisão e a documentação do comportamento real do sistema. O que ainda falta é validação clínica e melhoria estatística do limite operacional para tornar essa solução utilizável em ambiente assistencial real.
 
