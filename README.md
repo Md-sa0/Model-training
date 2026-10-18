@@ -148,6 +148,24 @@ Esse comando:
 
 A saída é um diagnóstico de apoio à decisão e não um diagnóstico médico. A mensagem de disclaimer está incluída na resposta.
 
+## API REST longitudinal (protótipo local)
+
+Há agora uma API FastAPI separada da pipeline de treinamento. Ela expõe inferência pontual e registro persistente em SQLite de pacientes, episódios, observações imutáveis e avaliações ligadas à observação. Criar observação não executa o modelo; avaliações usam a inferência existente, calibrador e threshold congelados. A API não é uma integração hospitalar nem monitoramento em tempo real.
+
+Consulte [API.md](API.md) para instalação, variáveis de ambiente, contratos e exemplos de todos os endpoints, respostas de erro, limites de segurança e plano de validação temporal. Para iniciar localmente:
+
+```powershell
+python -m pip install -r requirements-gpu.txt -r requirements-api.txt -r requirements-test.txt
+python -m pip install -e . --no-deps
+python -m uvicorn qwen_sepsis.service_api:app --app-dir src --host 127.0.0.1 --port 8000
+```
+
+O serviço permanece disponível se o modelo não puder ser carregado: `GET /health` distingue o estado da API de `model_ready`, e inferências retornam `503` enquanto o modelo não estiver pronto. O SQLite padrão é `data/service.sqlite3`; **não use dados de pacientes reais** sem implementar autenticação, autorização, auditoria, criptografia, retenção e demais controles descritos em [API.md](API.md).
+
+## Frontend React
+
+O MVP web está isolado em [frontend/](frontend/), usa os contratos implementados pela API e encaminha chamadas locais pelo proxy do Vite. Consulte [frontend/README.md](frontend/README.md) para instalação, configuração e comandos dos dois terminais no Windows. A interface é experimental; não conecte dados clínicos reais.
+
 ## Limitações do trabalho
 
 ### 1) Não é um sistema clínico validado
@@ -210,4 +228,3 @@ Eles cobrem a divisão por paciente, ausência de informação futura, janela te
 Este repositório finaliza a etapa de decisão de risco de sepse sobre o modelo já treinado, sem treinar de novo nem trocar pesos. O trabalho demonstra um fluxo operacional completo de apoio à decisão, com calibrador e limiar congelados e com uma CLI de teste para observação atual do paciente.
 
 O que está concluído é a cadeia de decisão e a documentação do comportamento real do sistema. O que ainda falta é validação clínica e melhoria estatística do limite operacional para tornar essa solução utilizável em ambiente assistencial real.
-
